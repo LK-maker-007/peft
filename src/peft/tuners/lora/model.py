@@ -685,6 +685,12 @@ class LoraModel(BaseTuner):
                 raise ValueError(
                     f"add_weighted_adapter does not support targeting nn.Parameter (problematic adapter '{adapter}')"
                 )
+            # these variants learn state besides lora_A and lora_B (the DoRA magnitude vector, KaSA's lora_diag)
+            # which has no defined combination, so the result would silently differ from the source adapters
+            if self.peft_config[adapter].use_dora:
+                raise ValueError(f"add_weighted_adapter does not support DoRA (problematic adapter '{adapter}')")
+            if self.peft_config[adapter].kasa_config is not None:
+                raise ValueError(f"add_weighted_adapter does not support KaSA (problematic adapter '{adapter}')")
 
         # If more than one of the adapters targets the same module with modules_to_save, raise an error, as these
         # modules cannot be merged. First, find the ModulesToSaveWrapper instances in the model, then check if they
@@ -832,6 +838,9 @@ class LoraModel(BaseTuner):
             target_modules=new_target_modules,
             alpha_pattern={},
             rank_pattern={},
+            # the combination below writes the complete delta into lora_A and lora_B, so the new adapter must not
+            # rescale it. use_rslora would give scaling sqrt(new_rank) here instead of lora_alpha / r == 1.
+            use_rslora=False,
         )
         self.inject_adapter(self.model, adapter_name)
 
@@ -898,6 +907,15 @@ class LoraModel(BaseTuner):
                     target_lora_A.data, target_lora_B.data = self._generalized_task_arithmetic_weighted_adapter(
                         combination_type, adapters, weights, target, density, majority_sign_method
                     )
+
+                if target.lora_bias.get(adapter_name, False):
+                    # the bias enters the output as lora_B.bias * scaling, independently of the lora_A/lora_B
+                    # factorization, so it combines exactly for every combination_type
+                    new_bias = torch.zeros_like(target.lora_B[adapter_name].bias)
+                    for adapter, weight in zip(adapters, weights):
+                        if adapter in target.lora_B and target.lora_bias.get(adapter, False):
+                            new_bias += weight * target.scaling[adapter] * target.lora_B[adapter].bias.data
+                    target.lora_B[adapter_name].bias.data = new_bias
 
     def _svd_generalized_task_arithmetic_weighted_adapter(
         self,
